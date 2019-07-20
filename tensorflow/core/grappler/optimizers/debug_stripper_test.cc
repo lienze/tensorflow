@@ -39,8 +39,37 @@ TEST_F(DebugStripperTest, OutputEqualToInput) {
 
   DebugStripper optimizer;
   GraphDef output;
+  EXPECT_EQ(optimizer.Optimize(nullptr, item, &output),
+            errors::Aborted("Nothing to do."));
+}
+
+TEST_F(DebugStripperTest, StripAssertOnTwoOutputs) {
+  tensorflow::Scope s = tensorflow::Scope::NewRootScope();
+  Output input = ops::Placeholder(s.WithOpName("input"), DT_FLOAT,
+                                  ops::Placeholder::Shape({6}));
+  auto split =
+      ops::Split(s.WithOpName("split"), /*axis=*/0, input, /*num_split=*/2);
+  Output x = split[0];
+  Output y = split[1];
+  Output ge = ops::GreaterEqual(s.WithOpName("GreaterEqual"), x, y);
+  auto assert = ops::Assert(s.WithOpName("Assert"), ge, {x, y});
+  Output add = ops::Add(
+      s.WithOpName("add").WithControlDependencies({assert.operation}), x, y);
+
+  GrapplerItem item;
+  TF_CHECK_OK(s.ToGraphDef(&item.graph));
+
+  DebugStripper optimizer;
+  GraphDef output;
   TF_EXPECT_OK(optimizer.Optimize(nullptr, item, &output));
-  CompareGraphs(item.graph, output);
+
+  for (const NodeDef& node : output.node()) {
+    for (const string& input : node.input()) {
+      if (IsControlInput(input)) {
+        EXPECT_EQ(input.find(':'), -1);
+      }
+    }
+  }
 }
 
 TEST_F(DebugStripperTest, StripAssertFromGraph) {
@@ -161,6 +190,42 @@ TEST_F(DebugStripperTest, StripCheckNumericsFromGraph) {
       EvaluateNodes(item.graph, {"z"}, {{"x", x_t}, {"y", y_t}});
   std::vector<Tensor> optimized =
       EvaluateNodes(output, {"z"}, {{"x", x_t}, {"y", y_t}});
+  test::ExpectTensorEqual<float>(expected[0], optimized[0]);
+}
+
+TEST_F(DebugStripperTest, StripPrintFromGraph) {
+  tensorflow::Scope s = tensorflow::Scope::NewRootScope();
+  Output x = ops::Placeholder(s.WithOpName("x"), DT_FLOAT,
+                              ops::Placeholder::Shape({}));
+  Output print = ops::Print(s.WithOpName("Print"), x, {x});
+  GrapplerItem item;
+  TF_CHECK_OK(s.ToGraphDef(&item.graph));
+
+  DebugStripper optimizer;
+  GraphDef output;
+  TF_EXPECT_OK(optimizer.Optimize(nullptr, item, &output));
+
+  for (const NodeDef& node : output.node()) {
+    if (node.name() == "x") {
+      EXPECT_EQ("Placeholder", node.op());
+      EXPECT_EQ(0, node.input_size());
+    } else if (node.name() == "Print") {
+      EXPECT_EQ("Identity", node.op());
+      EXPECT_EQ(2, node.input_size());
+      EXPECT_EQ("x", node.input(0));
+      EXPECT_EQ("^x", node.input(1));
+      EXPECT_EQ(1, node.attr_size());
+    }
+  }
+
+  EXPECT_EQ(2, output.node_size());
+
+  Tensor x_t(DT_FLOAT, TensorShape({}));
+  x_t.flat<float>()(0) = 1.0f;
+  std::vector<Tensor> expected =
+      EvaluateNodes(item.graph, {"Print"}, {{"x", x_t}});
+  std::vector<Tensor> optimized =
+      EvaluateNodes(output, {"Print"}, {{"x", x_t}});
   test::ExpectTensorEqual<float>(expected[0], optimized[0]);
 }
 
